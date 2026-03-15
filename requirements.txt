@@ -1,0 +1,5 @@
+Flask==3.1.*
+flask-cors==5.*
+Pillow==11.*
+gunicorn==23.*
+requests>=2.31
