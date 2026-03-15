@@ -125,10 +125,13 @@ jobs:
           CELL_KEY: ${{ inputs.cell_key }}
         run: |
           STATUS="done"
+          SIZE=0
           if [ "${{ job.status }}" != "success" ]; then
             STATUS="error"
+          else
+            SIZE=$(stat -c%s /tmp/output.mp4 2>/dev/null || stat -f%z /tmp/output.mp4 2>/dev/null || echo 0)
           fi
           curl -s -X POST "${WORKER_URL}/api/webhook/complete" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${WEBHOOK_SECRET}" \
-            -d "{\"cell_key\": \"${CELL_KEY}\", \"status\": \"${STATUS}\"}"
+            -d "{\"cell_key\": \"${CELL_KEY}\", \"status\": \"${STATUS}\", \"size\": ${SIZE}}"
