@@ -84,6 +84,7 @@ jobs:
           with open('/tmp/text_input.txt') as f:
               text = f.read()
           image_path = open('/tmp/image_path.txt').read().strip()
+          audio_path = 'audio.mp3' if os.path.exists('audio.mp3') else None
           render_video(
               image_path=image_path,
               text=text,
@@ -91,6 +92,7 @@ jobs:
               scroll_speed=int(os.environ.get('SCROLL_SPEED', '80')),
               hook_font_size=int(os.environ.get('HOOK_FONT_SIZE', '52')),
               body_font_size=int(os.environ.get('BODY_FONT_SIZE', '38')),
+              audio_path=audio_path,
           )
           print('Video rendered successfully')
           "
