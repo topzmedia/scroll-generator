@@ -42,17 +42,8 @@ jobs:
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          IMAGE_R2_KEY: ${{ inputs.image_r2_key }}
         run: |
-          python3 -c "
-          import boto3, os
-          s3 = boto3.client('s3',
-              endpoint_url='https://346c911ecd013de0d51b44f77e5f2ec0.r2.cloudflarestorage.com',
-              aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
-              aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
-              region_name='auto')
-          s3.download_file('scroll-generator', '${{ inputs.image_r2_key }}', '/tmp/input_image${{ inputs.image_r2_key }}')
-          " 2>&1 || true
-          # Handle extension properly
           python3 -c "
           import boto3, os, pathlib
           s3 = boto3.client('s3',
@@ -60,25 +51,35 @@ jobs:
               aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
               aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
               region_name='auto')
-          key = '${{ inputs.image_r2_key }}'
+          key = os.environ['IMAGE_R2_KEY']
           ext = pathlib.Path(key).suffix or '.png'
           local_path = f'/tmp/input_image{ext}'
           s3.download_file('scroll-generator', key, local_path)
           with open('/tmp/image_path.txt', 'w') as f:
               f.write(local_path)
+          print(f'Downloaded {key} to {local_path}')
+          "
+
+      - name: Write text to file
+        env:
+          VIDEO_TEXT: ${{ inputs.text }}
+        run: |
+          python3 -c "
+          import os
+          text = os.environ['VIDEO_TEXT']
+          with open('/tmp/text_input.txt', 'w') as f:
+              f.write(text)
+          print(f'Wrote {len(text)} chars to /tmp/text_input.txt')
           "
 
       - name: Render video
+        env:
+          SCROLL_SPEED: ${{ inputs.scroll_speed }}
+          HOOK_FONT_SIZE: ${{ inputs.hook_font_size }}
+          BODY_FONT_SIZE: ${{ inputs.body_font_size }}
         run: |
-          IMAGE_PATH=$(cat /tmp/image_path.txt)
-          # Write text to file to handle special characters
           python3 -c "
-          import sys
-          text = '''${{ inputs.text }}'''
-          with open('/tmp/text_input.txt', 'w') as f:
-              f.write(text)
-          "
-          python3 -c "
+          import os
           from renderer import render_video
           with open('/tmp/text_input.txt') as f:
               text = f.read()
@@ -87,9 +88,9 @@ jobs:
               image_path=image_path,
               text=text,
               output_path='/tmp/output.mp4',
-              scroll_speed=int('${{ inputs.scroll_speed }}'),
-              hook_font_size=int('${{ inputs.hook_font_size }}'),
-              body_font_size=int('${{ inputs.body_font_size }}'),
+              scroll_speed=int(os.environ.get('SCROLL_SPEED', '80')),
+              hook_font_size=int(os.environ.get('HOOK_FONT_SIZE', '52')),
+              body_font_size=int(os.environ.get('BODY_FONT_SIZE', '38')),
           )
           print('Video rendered successfully')
           "
@@ -98,6 +99,7 @@ jobs:
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CELL_KEY: ${{ inputs.cell_key }}
         run: |
           python3 -c "
           import boto3, os
@@ -106,10 +108,11 @@ jobs:
               aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
               aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
               region_name='auto')
+          cell_key = os.environ['CELL_KEY']
           s3.upload_file('/tmp/output.mp4', 'scroll-generator',
-              'videos/generated/${{ inputs.cell_key }}.mp4',
+              f'videos/generated/{cell_key}.mp4',
               ExtraArgs={'ContentType': 'video/mp4'})
-          print('Uploaded to R2')
+          print(f'Uploaded videos/generated/{cell_key}.mp4 to R2')
           "
 
       - name: Notify completion
@@ -117,6 +120,7 @@ jobs:
         env:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
+          CELL_KEY: ${{ inputs.cell_key }}
         run: |
           STATUS="done"
           if [ "${{ job.status }}" != "success" ]; then
@@ -125,4 +129,4 @@ jobs:
           curl -s -X POST "${WORKER_URL}/api/webhook/complete" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${WEBHOOK_SECRET}" \
-            -d "{\"cell_key\": \"${{ inputs.cell_key }}\", \"status\": \"${STATUS}\"}"
+            -d "{\"cell_key\": \"${CELL_KEY}\", \"status\": \"${STATUS}\"}"
