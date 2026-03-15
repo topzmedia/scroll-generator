@@ -1,12 +1,14 @@
 """
 Flask web app – Video library with Image Gallery, Text Library & Combination Matrix.
 Uses SQLite for persistent storage (replaces library.json / status.json).
+Uses Cloudflare R2 (S3-compatible) for image/video file storage.
 """
 
 import csv
 import io
 import json
 import sqlite3
+import tempfile
 import threading
 import uuid
 import zipfile
@@ -14,9 +16,12 @@ from pathlib import Path
 
 from PIL import Image as PILImage
 import os
+import boto3
+from botocore.exceptions import ClientError
 
 from flask import (
     Flask,
+    Response,
     jsonify,
     render_template,
     request,
@@ -34,9 +39,6 @@ CORS(app, origins=os.environ.get("CORS_ORIGINS", "*").split(","))
 
 BASE_DIR = Path(__file__).parent
 LIBRARY_DIR = BASE_DIR / "library"
-IMAGES_DIR = LIBRARY_DIR / "images"
-VIDEOS_DIR = LIBRARY_DIR / "videos"
-UPLOADED_DIR = VIDEOS_DIR / "uploaded"
 AUDIO_PATH = BASE_DIR / "audio.mp3"
 DB_PATH = LIBRARY_DIR / "library.db"
 
@@ -46,6 +48,121 @@ VIDEO_SEMAPHORE = threading.Semaphore(1)
 # Legacy JSON paths (for migration only)
 _LEGACY_LIBRARY_JSON = LIBRARY_DIR / "library.json"
 _LEGACY_STATUS_JSON = LIBRARY_DIR / "status.json"
+
+# ── R2 / S3 configuration ────────────────────────────────────────────────────
+
+R2_ENDPOINT = "https://346c911ecd013de0d51b44f77e5f2ec0.r2.cloudflarestorage.com"
+R2_BUCKET = "scroll-generator"
+
+_s3_client = None
+_s3_lock = threading.Lock()
+
+
+def _get_s3():
+    """Return a shared boto3 S3 client (created lazily, thread-safe)."""
+    global _s3_client
+    if _s3_client is None:
+        with _s3_lock:
+            if _s3_client is None:
+                _s3_client = boto3.client(
+                    "s3",
+                    endpoint_url=R2_ENDPOINT,
+                    aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+                    aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+                    region_name="auto",
+                )
+    return _s3_client
+
+
+def r2_upload_fileobj(fileobj, key: str, content_type: str | None = None):
+    """Upload a file-like object to R2."""
+    extra = {}
+    if content_type:
+        extra["ContentType"] = content_type
+    _get_s3().upload_fileobj(fileobj, R2_BUCKET, key, ExtraArgs=extra or None)
+
+
+def r2_upload_file(local_path: str, key: str, content_type: str | None = None):
+    """Upload a local file to R2."""
+    extra = {}
+    if content_type:
+        extra["ContentType"] = content_type
+    _get_s3().upload_file(local_path, R2_BUCKET, key, ExtraArgs=extra or None)
+
+
+def r2_download_file(key: str, local_path: str):
+    """Download a file from R2 to a local path."""
+    _get_s3().download_file(R2_BUCKET, key, local_path)
+
+
+def r2_delete(key: str):
+    """Delete an object from R2. Silently ignores if it doesn't exist."""
+    try:
+        _get_s3().delete_object(Bucket=R2_BUCKET, Key=key)
+    except ClientError:
+        pass
+
+
+def r2_exists(key: str) -> bool:
+    """Check if an object exists in R2."""
+    try:
+        _get_s3().head_object(Bucket=R2_BUCKET, Key=key)
+        return True
+    except ClientError:
+        return False
+
+
+def r2_get_size(key: str) -> int | None:
+    """Return the size of an R2 object in bytes, or None if it doesn't exist."""
+    try:
+        resp = _get_s3().head_object(Bucket=R2_BUCKET, Key=key)
+        return resp["ContentLength"]
+    except ClientError:
+        return None
+
+
+def r2_get_object(key: str) -> bytes | None:
+    """Download an R2 object into memory. Returns None if not found."""
+    try:
+        resp = _get_s3().get_object(Bucket=R2_BUCKET, Key=key)
+        return resp["Body"].read()
+    except ClientError:
+        return None
+
+
+def r2_list_keys(prefix: str) -> list[str]:
+    """List all keys in R2 with a given prefix."""
+    keys = []
+    paginator = _get_s3().get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+    return keys
+
+
+def r2_delete_prefix(prefix: str):
+    """Delete all objects under a given prefix."""
+    keys = r2_list_keys(prefix)
+    if keys:
+        # S3 delete_objects accepts up to 1000 at a time
+        for i in range(0, len(keys), 1000):
+            batch = [{"Key": k} for k in keys[i : i + 1000]]
+            _get_s3().delete_objects(Bucket=R2_BUCKET, Delete={"Objects": batch})
+
+
+# ── R2 key helpers ────────────────────────────────────────────────────────────
+
+def _r2_image_key(image_id: str, ext: str) -> str:
+    return f"images/{image_id}{ext}"
+
+
+def _r2_video_key(cell_key: str) -> str:
+    return f"videos/generated/{cell_key}.mp4"
+
+
+def _r2_uploaded_video_key(cell_key: str) -> str:
+    return f"videos/uploaded/{cell_key}.mp4"
+
 
 # ── SQLite helpers ───────────────────────────────────────────────────────────
 
@@ -60,9 +177,6 @@ def _get_db() -> sqlite3.Connection:
 def _init_db():
     """Create tables and migrate from legacy JSON files if they exist."""
     LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
-    UPLOADED_DIR.mkdir(parents=True, exist_ok=True)
 
     conn = _get_db()
     conn.executescript("""
@@ -94,14 +208,26 @@ CREATE TABLE IF NOT EXISTS texts (
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+    # Add r2_key column if missing (R2 migration)
+    try:
+        conn.execute("ALTER TABLE images ADD COLUMN r2_key TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
     # Compute perceptual hashes for images that don't have one yet
-    unhashed = conn.execute("SELECT id, path FROM images WHERE phash IS NULL").fetchall()
+    # For R2-backed images we skip local file hashing at startup;
+    # hashes are computed at upload time.
+    unhashed = conn.execute(
+        "SELECT id, path, r2_key FROM images WHERE phash IS NULL"
+    ).fetchall()
     if unhashed:
         hashed_count = 0
         for row in unhashed:
-            if Path(row["path"]).is_file():
+            local_path = row["path"]
+            if local_path and Path(local_path).is_file():
                 try:
-                    phash = _compute_dhash(row["path"])
+                    phash = _compute_dhash(local_path)
                     conn.execute("UPDATE images SET phash = ? WHERE id = ?", (phash, row["id"]))
                     hashed_count += 1
                 except Exception as e:
@@ -268,22 +394,25 @@ def _find_duplicate_groups(images: list[dict]) -> dict[str, int | None]:
 
 def db_get_images() -> list[dict]:
     conn = _get_db()
-    rows = conn.execute("SELECT id, filename, path, phash FROM images").fetchall()
+    rows = conn.execute("SELECT id, filename, path, phash, r2_key FROM images").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def db_get_image(image_id: str) -> dict | None:
     conn = _get_db()
-    row = conn.execute("SELECT id, filename, path, phash FROM images WHERE id = ?", (image_id,)).fetchone()
+    row = conn.execute("SELECT id, filename, path, phash, r2_key FROM images WHERE id = ?", (image_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def db_add_image(img_id: str, filename: str, path: str, phash: str | None = None):
+def db_add_image(img_id: str, filename: str, path: str, phash: str | None = None, r2_key: str | None = None):
     conn = _get_db()
     with conn:
-        conn.execute("INSERT INTO images (id, filename, path, phash) VALUES (?, ?, ?, ?)", (img_id, filename, path, phash))
+        conn.execute(
+            "INSERT INTO images (id, filename, path, phash, r2_key) VALUES (?, ?, ?, ?, ?)",
+            (img_id, filename, path, phash, r2_key),
+        )
     conn.close()
 
 
@@ -390,12 +519,13 @@ def list_images():
 
     result = []
     for img in images:
-        p = Path(img["path"])
+        r2_key = img.get("r2_key")
+        exists = r2_exists(r2_key) if r2_key else Path(img["path"]).is_file()
         entry = {
             "id": img["id"],
             "filename": img["filename"],
             "url": f"/api/images/{img['id']}/file",
-            "exists": p.is_file(),
+            "exists": exists,
             "duplicate_group": dup_groups.get(img["id"]),
         }
         result.append(entry)
@@ -410,6 +540,19 @@ def serve_image(image_id):
     img = db_get_image(image_id)
     if not img:
         return jsonify({"error": "Not found"}), 404
+
+    r2_key = img.get("r2_key")
+    if r2_key:
+        data = r2_get_object(r2_key)
+        if data is None:
+            return jsonify({"error": "File missing from R2"}), 404
+        # Guess content type from extension
+        ext = Path(r2_key).suffix.lower()
+        mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
+        mime = mime_map.get(ext, "application/octet-stream")
+        return Response(data, mimetype=mime)
+
+    # Fallback: serve from local filesystem (legacy images)
     p = Path(img["path"])
     if p.is_file():
         return send_file(str(p))
@@ -425,16 +568,33 @@ def upload_images():
             continue
         img_id = "img_" + str(uuid.uuid4())[:8]
         ext = Path(f.filename).suffix.lower() or ".png"
-        safe_name = f"{img_id}{ext}"
-        save_path = IMAGES_DIR / safe_name
-        f.save(str(save_path))
+        r2_key = _r2_image_key(img_id, ext)
+
+        # Save to a temp file first so we can compute phash
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp_path = tmp.name
+            f.save(tmp_path)
+
         phash = None
         try:
-            phash = _compute_dhash(str(save_path))
+            phash = _compute_dhash(tmp_path)
         except Exception as e:
             print(f"Failed to hash uploaded image {img_id}: {e}")
-        db_add_image(img_id, f.filename, str(save_path), phash)
-        uploaded.append({"id": img_id, "filename": f.filename, "path": str(save_path)})
+
+        # Upload to R2
+        mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
+        content_type = mime_map.get(ext, "application/octet-stream")
+        r2_upload_file(tmp_path, r2_key, content_type=content_type)
+
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+        # Store in DB with r2_key; path is kept empty for R2-backed images
+        db_add_image(img_id, f.filename, "", phash, r2_key=r2_key)
+        uploaded.append({"id": img_id, "filename": f.filename, "r2_key": r2_key})
 
     return jsonify({"uploaded": len(uploaded), "images": uploaded})
 
@@ -445,10 +605,16 @@ def delete_image(image_id):
     if not img:
         return jsonify({"error": "Not found"}), 404
 
-    # Remove original file
-    p = Path(img["path"])
-    if p.is_file():
-        p.unlink()
+    # Remove from R2
+    r2_key = img.get("r2_key")
+    if r2_key:
+        r2_delete(r2_key)
+
+    # Remove local file if it exists (legacy)
+    if img["path"]:
+        p = Path(img["path"])
+        if p.is_file():
+            p.unlink()
 
     # Remove generated videos for this image
     _remove_videos_for_image(image_id)
@@ -458,10 +624,11 @@ def delete_image(image_id):
 
 
 def _remove_videos_for_image(image_id: str):
-    """Delete all generated videos that use this image."""
-    prefix = f"{image_id}__"
-    for vf in VIDEOS_DIR.glob(f"{prefix}*.mp4"):
-        vf.unlink()
+    """Delete all generated videos (on R2) that use this image."""
+    prefix_gen = f"videos/generated/{image_id}__"
+    prefix_up = f"videos/uploaded/{image_id}__"
+    r2_delete_prefix(prefix_gen)
+    r2_delete_prefix(prefix_up)
 
 
 # ── Texts ────────────────────────────────────────────────────────────────────
@@ -549,10 +716,17 @@ def manage_text(text_id):
 
 
 def _remove_videos_for_text(text_id: str):
-    """Delete all generated videos that use this text."""
-    suffix = f"__{text_id}.mp4"
-    for vf in VIDEOS_DIR.glob(f"*{suffix}"):
-        vf.unlink()
+    """Delete all generated videos (on R2) that use this text."""
+    # We need to find keys ending with __{text_id}.mp4 in both prefixes.
+    # R2/S3 only supports prefix-based listing, so list all and filter.
+    for prefix in ("videos/generated/", "videos/uploaded/"):
+        keys = r2_list_keys(prefix)
+        suffix = f"__{text_id}.mp4"
+        to_delete = [k for k in keys if k.endswith(suffix)]
+        if to_delete:
+            for i in range(0, len(to_delete), 1000):
+                batch = [{"Key": k} for k in to_delete[i : i + 1000]]
+                _get_s3().delete_objects(Bucket=R2_BUCKET, Delete={"Objects": batch})
 
 
 # ── Matrix / Library state ───────────────────────────────────────────────────
@@ -570,26 +744,27 @@ def get_library():
     for img in images:
         for txt in texts:
             cell_key = f"{img['id']}__{txt['id']}"
-            video_path = VIDEOS_DIR / f"{cell_key}.mp4"
+            gen_key = _r2_video_key(cell_key)
+            uploaded_key = _r2_uploaded_video_key(cell_key)
             gs = all_status.get(cell_key)
             if gs == "generating":
                 videos[cell_key] = {"status": "generating"}
             elif gs == "uploaded":
-                uploaded_path = UPLOADED_DIR / f"{cell_key}.mp4"
-                if uploaded_path.is_file():
-                    stat = uploaded_path.stat()
+                size = r2_get_size(uploaded_key)
+                if size is not None:
                     videos[cell_key] = {
                         "status": "uploaded",
-                        "size": stat.st_size,
+                        "size": size,
                         "url": f"/api/video/{cell_key}",
                     }
-            elif video_path.is_file():
-                stat = video_path.stat()
-                videos[cell_key] = {
-                    "status": "done",
-                    "size": stat.st_size,
-                    "url": f"/api/video/{cell_key}",
-                }
+            elif gs == "done":
+                size = r2_get_size(gen_key)
+                if size is not None:
+                    videos[cell_key] = {
+                        "status": "done",
+                        "size": size,
+                        "url": f"/api/video/{cell_key}",
+                    }
 
     # Build image list
     image_list = []
@@ -613,23 +788,36 @@ def get_library():
 @app.route("/api/video/<cell_key>")
 def serve_video(cell_key):
     safe = Path(cell_key).name
-    video_path = VIDEOS_DIR / f"{safe}.mp4"
-    if video_path.is_file():
-        return send_file(str(video_path), mimetype="video/mp4")
-    uploaded_path = UPLOADED_DIR / f"{safe}.mp4"
-    if uploaded_path.is_file():
-        return send_file(str(uploaded_path), mimetype="video/mp4")
+    gen_key = _r2_video_key(safe)
+    uploaded_key = _r2_uploaded_video_key(safe)
+
+    # Try generated video first, then uploaded
+    for key in (gen_key, uploaded_key):
+        data = r2_get_object(key)
+        if data is not None:
+            return Response(data, mimetype="video/mp4")
+
     return jsonify({"error": "Not found"}), 404
 
 
 @app.route("/api/video/<cell_key>/upload", methods=["POST"])
 def mark_video_uploaded(cell_key):
     safe = Path(cell_key).name
-    video_path = VIDEOS_DIR / f"{safe}.mp4"
-    uploaded_path = UPLOADED_DIR / f"{safe}.mp4"
-    if not video_path.is_file():
+    gen_key = _r2_video_key(safe)
+    uploaded_key = _r2_uploaded_video_key(safe)
+
+    if not r2_exists(gen_key):
         return jsonify({"error": "Video not found"}), 404
-    video_path.rename(uploaded_path)
+
+    # Copy from generated to uploaded, then delete the original
+    # S3 copy_object requires the source as Bucket/Key
+    _get_s3().copy_object(
+        Bucket=R2_BUCKET,
+        CopySource={"Bucket": R2_BUCKET, "Key": gen_key},
+        Key=uploaded_key,
+    )
+    r2_delete(gen_key)
+
     db_set_gen_status(safe, "uploaded")
     return jsonify({"status": "uploaded"})
 
@@ -637,12 +825,8 @@ def mark_video_uploaded(cell_key):
 @app.route("/api/video/<cell_key>", methods=["DELETE"])
 def delete_video(cell_key):
     safe = Path(cell_key).name
-    video_path = VIDEOS_DIR / f"{safe}.mp4"
-    uploaded_path = UPLOADED_DIR / f"{safe}.mp4"
-    if video_path.is_file():
-        video_path.unlink()
-    if uploaded_path.is_file():
-        uploaded_path.unlink()
+    r2_delete(_r2_video_key(safe))
+    r2_delete(_r2_uploaded_video_key(safe))
     db_set_gen_status(safe, "error")
     return jsonify({"message": "Deleted"})
 
@@ -679,7 +863,12 @@ def generate():
     for p in pairs:
         img = img_map.get(p["image_id"])
         txt = txt_map.get(p["text_id"])
-        if img and txt and Path(img["path"]).is_file():
+        if not img or not txt:
+            continue
+        # Check image exists either on R2 or locally
+        r2_key = img.get("r2_key")
+        has_file = (r2_key and r2_exists(r2_key)) or (img["path"] and Path(img["path"]).is_file())
+        if has_file:
             cell_key = f"{img['id']}__{txt['id']}"
             db_set_gen_status(cell_key, "generating")
             valid_pairs.append((img, txt, cell_key))
@@ -689,31 +878,54 @@ def generate():
 
     def _run():
         for img, txt, cell_key in valid_pairs:
-            # Delete old video so stale file doesn't persist on failure
-            old_video = VIDEOS_DIR / f"{cell_key}.mp4"
-            if old_video.is_file():
-                old_video.unlink()
+            # Delete old video from R2
+            r2_delete(_r2_video_key(cell_key))
 
-            actual_path = img["path"]
-
-            out_path = str(VIDEOS_DIR / f"{cell_key}.mp4")
             VIDEO_SEMAPHORE.acquire()
+            tmp_image_path = None
+            tmp_video_path = None
             try:
+                # Get the image to a local temp file
+                r2_key = img.get("r2_key")
+                if r2_key:
+                    ext = Path(r2_key).suffix or ".png"
+                    tmp_img_fd, tmp_image_path = tempfile.mkstemp(suffix=ext)
+                    os.close(tmp_img_fd)
+                    r2_download_file(r2_key, tmp_image_path)
+                    actual_image_path = tmp_image_path
+                else:
+                    actual_image_path = img["path"]
+
+                # Create temp file for output video
+                tmp_vid_fd, tmp_video_path = tempfile.mkstemp(suffix=".mp4")
+                os.close(tmp_vid_fd)
+
                 render_video(
-                    image_path=actual_path,
+                    image_path=actual_image_path,
                     text=txt["text"],
-                    output_path=out_path,
+                    output_path=tmp_video_path,
                     scroll_speed=scroll_speed,
                     hook_font_size=hook_font_size,
                     body_font_size=body_font_size,
                     audio_path=str(AUDIO_PATH),
                 )
+
+                # Upload rendered video to R2
+                r2_upload_file(tmp_video_path, _r2_video_key(cell_key), content_type="video/mp4")
                 db_set_gen_status(cell_key, "done")
+
             except Exception as e:
                 db_set_gen_status(cell_key, "error")
                 print(f"Error generating {cell_key}: {e}")
             finally:
                 VIDEO_SEMAPHORE.release()
+                # Clean up temp files
+                for tmp in (tmp_image_path, tmp_video_path):
+                    if tmp:
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
@@ -759,7 +971,11 @@ def download():
     cells = data.get("cells", [])
 
     if not cells:
-        cells = [f.stem for f in VIDEOS_DIR.glob("*.mp4")]
+        # List all generated and uploaded videos from R2
+        gen_keys = r2_list_keys("videos/generated/")
+        up_keys = r2_list_keys("videos/uploaded/")
+        all_keys = gen_keys + up_keys
+        cells = list({Path(k).stem for k in all_keys if k.endswith(".mp4")})
 
     if not cells:
         return jsonify({"error": "No videos to download"}), 404
@@ -767,12 +983,13 @@ def download():
     zip_path = LIBRARY_DIR / "download.zip"
     with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
         for cell_key in cells:
-            vp = VIDEOS_DIR / f"{cell_key}.mp4"
-            up = UPLOADED_DIR / f"{cell_key}.mp4"
-            if vp.is_file():
-                zf.write(str(vp), vp.name)
-            elif up.is_file():
-                zf.write(str(up), up.name)
+            gen_key = _r2_video_key(cell_key)
+            up_key = _r2_uploaded_video_key(cell_key)
+            for key in (gen_key, up_key):
+                video_data = r2_get_object(key)
+                if video_data is not None:
+                    zf.writestr(f"{cell_key}.mp4", video_data)
+                    break
 
     return send_file(
         str(zip_path),

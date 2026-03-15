@@ -3,3 +3,4 @@ flask-cors==5.*
 Pillow==11.*
 gunicorn==23.*
 requests>=2.31
+boto3>=1.34
