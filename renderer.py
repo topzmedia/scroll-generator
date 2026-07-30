@@ -369,9 +369,51 @@ def _render_text_strip(
     return canvas
 
 
+def _render_title_band(
+    label_text: str,
+    hook_font_size: int,
+    color: str,
+    bg: str,
+) -> Image.Image:
+    """
+    The sticky title: the text's label on its own band, pinned right below
+    the image/video while the body scrolls underneath it.
+    """
+    max_text_width = VIDEO_WIDTH - 2 * PADDING_X
+    font = _load_font(bold=True, size=hook_font_size)
+    line_h = int(hook_font_size * LINE_SPACING_FACTOR)
+    lines = _wrap_text(label_text, font, max_text_width)
+    band = Image.new("RGB", (VIDEO_WIDTH, 2 * TEXT_GAP + line_h * len(lines)), bg)
+    draw = ImageDraw.Draw(band)
+    _draw_centered_lines(band, draw, lines, font, TEXT_GAP, VIDEO_WIDTH, line_h,
+                         color=color, bold=True)
+    return band
+
+
 def _normalize_word(word: str) -> str:
     """Comparable form of a word: lowercase letters and digits only."""
     return "".join(ch for ch in word.lower() if ch.isalnum())
+
+
+def _drop_label_prefix(spoken: list[dict], label_text: str) -> list[dict]:
+    """
+    The voice reads the label first, but with a sticky title the label is not
+    part of the scrolling strip — drop those leading spoken words so
+    alignment starts at the body copy.
+    """
+    targets = [t for t in (_normalize_word(w) for w in label_text.split()) if t]
+    if not targets:
+        return spoken
+    i, ti = 0, 0
+    while i < len(spoken) and ti < len(targets) and i <= len(targets) * 3:
+        nw = _normalize_word(spoken[i].get("text", ""))
+        if not nw:
+            i += 1
+            continue
+        if nw == targets[ti] or nw.startswith(targets[ti]) or targets[ti].startswith(nw):
+            ti += 1
+        i += 1
+    return spoken[i:]
 
 
 def _align_words(spoken: list[dict], boxes: list[dict]) -> list[dict]:
@@ -594,6 +636,8 @@ def render_video(
     highlight: bool = False,
     highlight_text_color: str = "#000000",
     highlight_bg_color: str = "#ffd93d",
+    title_text_color: str = None,
+    title_bg_color: str = None,
 ) -> str:
     """
     Render a scrolling video from image + text.
@@ -608,39 +652,42 @@ def render_video(
     """
     pct = int(image_height_pct or 0)
 
+    # --- Sticky title band: the label pinned right below the image ---
+    label_text = label.strip() if label else ""
+    title_band = None
+    if label_text:
+        title_band = _render_title_band(label_text, hook_font_size,
+                                        title_text_color or text_color,
+                                        title_bg_color or bg_color)
+    title_h = title_band.height if title_band else 0
+    # The scrolling body must keep a readable viewport below the band.
+    MIN_TEXT_VIEWPORT = 240
+
     # --- Build the two layer images ---
     if pct > 0:
         pct = max(1, min(95, pct))
         image_height = max(1, round(VIDEO_HEIGHT * pct / 100))
+        image_height = min(image_height, max(1, VIDEO_HEIGHT - title_h - MIN_TEXT_VIEWPORT))
         photo = _prepare_photo(image_path, target_height=image_height)
-        text_viewport_h = max(1, VIDEO_HEIGHT - image_height)
+        text_viewport_h = max(1, VIDEO_HEIGHT - image_height - title_h)
     else:
         photo = _prepare_photo(image_path)
         image_height = photo.height
-        text_viewport_h = max(1, VIDEO_HEIGHT - image_height)
-
-        # Measure label height — if it overflows the visible text area,
-        # shrink the photo so the full label is visible at the start.
-        label_text = label.strip() if label else ""
-        if label_text:
-            max_text_width = VIDEO_WIDTH - 2 * PADDING_X
-            label_font = _load_font(bold=True, size=hook_font_size)
-            label_lines = _wrap_text(label_text, label_font, max_text_width)
-            label_line_h = int(hook_font_size * LINE_SPACING_FACTOR)
-            label_total_h = TEXT_GAP + len(label_lines) * label_line_h + PARAGRAPH_GAP
-
-            if label_total_h > text_viewport_h:
-                text_viewport_h = label_total_h + PARAGRAPH_GAP
-                image_height = max(1, VIDEO_HEIGHT - text_viewport_h)
-                scale = image_height / photo.height
-                photo = photo.resize((int(photo.width * scale), image_height), Image.LANCZOS)
-                if photo.width > VIDEO_WIDTH:
-                    left = (photo.width - VIDEO_WIDTH) // 2
-                    photo = photo.crop((left, 0, left + VIDEO_WIDTH, image_height))
+        # Shrink the photo if the band + a readable viewport don't fit below.
+        max_image_h = max(1, VIDEO_HEIGHT - title_h - MIN_TEXT_VIEWPORT)
+        if image_height > max_image_h:
+            image_height = max_image_h
+            scale = image_height / photo.height
+            photo = photo.resize((int(photo.width * scale), image_height), Image.LANCZOS)
+            if photo.width > VIDEO_WIDTH:
+                left = (photo.width - VIDEO_WIDTH) // 2
+                photo = photo.crop((left, 0, left + VIDEO_WIDTH, image_height))
+        text_viewport_h = max(1, VIDEO_HEIGHT - image_height - title_h)
 
     word_boxes: list[dict] = []
+    # The label lives on the sticky band now, so the strip is body copy only.
     text_strip = _render_text_strip(text, text_viewport_h, hook_font_size, body_font_size,
-                                    label=label, bg_color=bg_color, text_color=text_color,
+                                    label="", bg_color=bg_color, text_color=text_color,
                                     word_boxes=word_boxes)
 
     temp_dir = Path(output_path).parent
@@ -650,6 +697,8 @@ def render_video(
     # Static background: photo on top, colored below (full viewport size)
     bg = Image.new("RGB", (VIDEO_WIDTH, VIDEO_HEIGHT), bg_color)
     bg.paste(photo, (0, 0))
+    if title_band is not None:
+        bg.paste(title_band, (0, image_height))
     temp_bg = temp_dir / f"_bg_{stem}.png"
     bg.save(str(temp_bg), "PNG")
 
@@ -679,7 +728,10 @@ def render_video(
     # --- Word alignment (drives both the speech-synced scroll and karaoke) ---
     aligned_words: list[dict] = []
     if has_vo and vo_words:
-        aligned_words = _align_words(vo_words, word_boxes)
+        # The voice reads the label first, but the sticky title is not part of
+        # the strip — align (and highlight) from the body copy onward.
+        spoken = _drop_label_prefix(vo_words, label_text) if title_band else vo_words
+        aligned_words = _align_words(spoken, word_boxes)
 
     # --- Karaoke highlight layer (needs the scroll timing above) ---
     highlight_layer = None
@@ -726,7 +778,7 @@ def render_video(
         text_label = "[txt_hl]"
         input_idx += 1
 
-    filter_parts.append(f"[0:v]{text_label}overlay=0:{image_height}[v_out]")
+    filter_parts.append(f"[0:v]{text_label}overlay=0:{image_height + title_h}[v_out]")
 
     audio_labels = []
     if has_music:
