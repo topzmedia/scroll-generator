@@ -18,6 +18,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -225,11 +226,30 @@ def _edge_tts(text: str, voice_name: str, out_path: Path) -> list[dict]:
     return _eleven_tts(text, ELEVEN_FALLBACK_VOICE, out_path)
 
 
+def strip_emoji(text: str) -> str:
+    """
+    Remove emoji (and their variation selectors) so the voice never reads them
+    aloud — TTS engines otherwise pronounce them as "fire", "check mark", etc.
+    The on-screen text keeps its emoji; only the spoken copy is stripped.
+    """
+    from renderer import EMOJI_RE
+
+    cleaned = EMOJI_RE.sub(" ", text)
+    # Collapse the gaps the emoji left behind, keeping paragraph breaks.
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r" ?\n ?", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def generate_voiceover(text: str, voice: str) -> dict:
     """
     Return {"path": <mp3 path>, "words": [{text, start, end}, ...]} for the
     given text + voice, generating and caching it on first use.
+
+    Emoji are stripped before the text reaches the TTS engine.
     """
+    text = strip_emoji(text)
     VO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha1(f"{voice}\n{text}".encode()).hexdigest()[:20]
     out_path = VO_CACHE_DIR / f"vo_{key}.mp3"

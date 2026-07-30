@@ -7,6 +7,7 @@ Pipeline:
 """
 
 import os
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -46,6 +47,144 @@ FONT_DIR = Path(__file__).parent / "fonts"
 FONT_REGULAR = FONT_DIR / "Poppins-Regular.ttf"
 FONT_BOLD = FONT_DIR / "Poppins-SemiBold.ttf"
 
+# Poppins has no emoji glyphs, so emoji are drawn from a colour emoji font.
+# Noto Color Emoji is a CBDT bitmap font: FreeType only accepts its native
+# strike size, so every emoji is rendered at EMOJI_STRIKE and scaled down.
+EMOJI_FONT_CANDIDATES = [
+    FONT_DIR / "NotoColorEmoji.ttf",
+    Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
+    Path("/usr/share/fonts/truetype/noto-color-emoji/NotoColorEmoji.ttf"),
+]
+EMOJI_STRIKE = 109
+
+# Emoji clusters: flags (regional-indicator pairs), keycaps, and any emoji base
+# plus its variation selectors / skin tones / ZWJ continuations.
+_EMOJI_BASE = (
+    "\U0001F300-\U0001F5FF\U0001F600-\U0001F64F\U0001F680-\U0001F6FF"
+    "\U0001F900-\U0001F9FF\U0001FA70-\U0001FAFF\U0001F000-\U0001F0FF"
+    "\U0001F170-\U0001F251☀-➿⬀-⯿←-⇿"
+    "⌀-⏿■-◿⁉‼™ℹ"
+)
+_MODIFIER = "[️︎\U0001F3FB-\U0001F3FF]*"
+_ATOM = f"[{_EMOJI_BASE}]{_MODIFIER}"
+EMOJI_RE = re.compile(
+    "(?:"
+    "[\U0001F1E6-\U0001F1FF]{2}"          # flags
+    "|[0-9#*]️?⃣"               # keycaps
+    f"|{_ATOM}(?:‍{_ATOM})*"         # emoji, incl. ZWJ sequences
+    ")"
+)
+
+_emoji_font = None
+_emoji_font_loaded = False
+_emoji_cache: dict = {}
+
+
+def _load_emoji_font():
+    """Load the colour emoji font once; None when unavailable."""
+    global _emoji_font, _emoji_font_loaded
+    if _emoji_font_loaded:
+        return _emoji_font
+    _emoji_font_loaded = True
+    for path in EMOJI_FONT_CANDIDATES:
+        if path.exists():
+            try:
+                _emoji_font = ImageFont.truetype(str(path), EMOJI_STRIKE)
+                break
+            except OSError as e:
+                print(f"Emoji font {path} unusable: {e}")
+    if _emoji_font is None:
+        print("No colour emoji font found — emoji will be dropped from the text")
+    return _emoji_font
+
+
+def _render_emoji(cluster: str, target_h: int) -> Image.Image | None:
+    """Return the emoji drawn at target_h pixels tall (cached), or None."""
+    key = (cluster, target_h)
+    if key in _emoji_cache:
+        return _emoji_cache[key]
+
+    font = _load_emoji_font()
+    img = None
+    if font is not None:
+        try:
+            canvas = Image.new("RGBA", (EMOJI_STRIKE * 3, EMOJI_STRIKE * 2), (0, 0, 0, 0))
+            ImageDraw.Draw(canvas).text((EMOJI_STRIKE // 4, EMOJI_STRIKE // 4), cluster,
+                                        font=font, embedded_color=True)
+            bbox = canvas.getbbox()
+            if bbox:
+                glyph = canvas.crop(bbox)
+                scale = target_h / glyph.height
+                img = glyph.resize((max(1, round(glyph.width * scale)), target_h), Image.LANCZOS)
+        except Exception as e:
+            print(f"Failed to render emoji {cluster!r}: {e}")
+    _emoji_cache[key] = img
+    return img
+
+
+def _emoji_metrics(font_size: int) -> tuple[int, int]:
+    """(target height, trailing gap) for emoji drawn alongside font_size text."""
+    return max(8, round(font_size * 1.05)), max(2, round(font_size * 0.08))
+
+
+def _split_runs(text: str) -> list[tuple[str, str]]:
+    """Split text into ('text'|'emoji', chunk) runs in order."""
+    runs = []
+    pos = 0
+    for m in EMOJI_RE.finditer(text):
+        if m.start() > pos:
+            runs.append(("text", text[pos:m.start()]))
+        runs.append(("emoji", m.group()))
+        pos = m.end()
+    if pos < len(text):
+        runs.append(("text", text[pos:]))
+    return runs
+
+
+def measure_text(text: str, font: ImageFont.FreeTypeFont) -> float:
+    """Advance width of text, counting emoji at their scaled bitmap width."""
+    emoji_h, emoji_gap = _emoji_metrics(font.size)
+    total = 0.0
+    for kind, chunk in _split_runs(text):
+        if kind == "text":
+            total += font.getlength(chunk)
+        else:
+            img = _render_emoji(chunk, emoji_h)
+            total += (img.width + emoji_gap) if img else 0
+    return total
+
+
+def _draw_rich_text(
+    canvas: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    x: float,
+    y: int,
+    color: str,
+) -> float:
+    """
+    Draw text at (x, y) with emoji pulled from the colour emoji font.
+
+    Returns the x position after the last run.  Emoji are centred on the text's
+    own visual centre so they sit on the same line as the words.
+    """
+    emoji_h, emoji_gap = _emoji_metrics(font.size)
+    ascent, _ = font.getmetrics()
+    centre_y = y + ascent - round(font.size * 0.35)
+
+    for kind, chunk in _split_runs(text):
+        if kind == "text":
+            draw.text((x, y), chunk, font=font, fill=color)
+            x += font.getlength(chunk)
+        else:
+            img = _render_emoji(chunk, emoji_h)
+            if img:
+                canvas.alpha_composite(img, (round(x), centre_y - img.height // 2)) \
+                    if canvas.mode == "RGBA" else canvas.paste(img, (round(x), centre_y - img.height // 2), img)
+                x += img.width + emoji_gap
+    return x
+
 
 def _load_font(bold: bool, size: int) -> ImageFont.FreeTypeFont:
     """Load a bundled font, falling back to default if missing."""
@@ -73,8 +212,7 @@ def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[
 
     for word in words:
         test_line = f"{current_line} {word}".strip()
-        bbox = font.getbbox(test_line)
-        w = bbox[2] - bbox[0]
+        w = measure_text(test_line, font)
         if w <= max_width:
             current_line = test_line
         else:
@@ -89,6 +227,7 @@ def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[
 
 
 def _draw_centered_lines(
+    canvas: Image.Image,
     draw: ImageDraw.ImageDraw,
     lines: list[str],
     font: ImageFont.FreeTypeFont,
@@ -108,17 +247,15 @@ def _draw_centered_lines(
     y = y_start
     space_w = font.getlength(" ")
     for line in lines:
-        bbox = font.getbbox(line)
-        w = bbox[2] - bbox[0]
-        x = (canvas_width - w) // 2
-        draw.text((x, y), line, font=font, fill=color)
-        if word_boxes is not None:
-            wx = float(x)
-            for word in line.split(" "):
-                if not word:
-                    wx += space_w
-                    continue
-                word_w = font.getlength(word)
+        x = (canvas_width - measure_text(line, font)) / 2
+        wx = x
+        for word in line.split(" "):
+            if not word:
+                wx += space_w
+                continue
+            word_w = measure_text(word, font)
+            _draw_rich_text(canvas, draw, word, font, wx, y, color)
+            if word_boxes is not None:
                 word_boxes.append({
                     "text": word,
                     "x": int(wx),
@@ -128,7 +265,7 @@ def _draw_centered_lines(
                     "line_h": line_height,
                     "bold": bold,
                 })
-                wx += word_w + space_w
+            wx += word_w + space_w
         y += line_height
     return y
 
@@ -219,13 +356,13 @@ def _render_text_strip(
 
     # Label
     if label_lines:
-        y = _draw_centered_lines(draw, label_lines, label_font, y, VIDEO_WIDTH, label_line_h,
+        y = _draw_centered_lines(canvas, draw, label_lines, label_font, y, VIDEO_WIDTH, label_line_h,
                                  color=text_color, bold=True, word_boxes=word_boxes)
         y += PARAGRAPH_GAP
 
     # Body
     for group in body_line_groups:
-        y = _draw_centered_lines(draw, group, body_font, y, VIDEO_WIDTH, body_line_h,
+        y = _draw_centered_lines(canvas, draw, group, body_font, y, VIDEO_WIDTH, body_line_h,
                                  color=text_color, bold=False, word_boxes=word_boxes)
         y += PARAGRAPH_GAP
 
@@ -307,7 +444,7 @@ def _build_highlight_layer(
         patch = Image.new("RGBA", (VIDEO_WIDTH, patch_h), (0, 0, 0, 0))
         pdraw = ImageDraw.Draw(patch)
         font = _load_font(bold=True, size=word["font_size"])
-        text_w = font.getlength(word["text"])
+        text_w = measure_text(word["text"], font)
         # Bold is wider than the regular glyphs underneath: grow the box around
         # the original word's centre so the highlight stays centred on it.
         cx = word["x"] + word["w"] / 2
@@ -322,7 +459,7 @@ def _build_highlight_layer(
             [x0 - pad_x, box_top, x0 + text_w + pad_x, box_bottom],
             radius=8, fill=bg_color,
         )
-        pdraw.text((x0, pad_y), word["text"], font=font, fill=text_color)
+        _draw_rich_text(patch, pdraw, word["text"], font, x0, pad_y, text_color)
 
         patch_path = temp_dir / f"_hl_{stem}_{idx:04d}.png"
         patch.save(str(patch_path), "PNG")
