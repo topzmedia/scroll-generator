@@ -400,6 +400,61 @@ def _align_words(spoken: list[dict], boxes: list[dict]) -> list[dict]:
     return matched
 
 
+def _build_scroll_expr(
+    words: list[dict],
+    max_scroll: int,
+    viewport_h: int,
+    start_delay: float,
+    scroll_end: float,
+) -> str | None:
+    """
+    Piecewise-linear scroll that follows the speech tempo: at the moment a
+    word is spoken, the line it sits on is about 1/3 down the visible text
+    area — never above the fold, never near the bottom.  One breakpoint per
+    text line (the first spoken word on it); between breakpoints the scroll
+    moves linearly, so pauses in the voice pause the scroll too.
+
+    Returns an ffmpeg time expression, or None when the timings give fewer
+    than two usable lines (caller falls back to the linear scroll).
+    """
+    anchor = viewport_h / 3.0
+    points = [(0.0, 0.0)]
+    last_y = None
+    for w in words:
+        y, t0 = w.get("y"), w.get("start")
+        if y is None or t0 is None:
+            continue
+        if last_y is not None and y <= last_y:
+            continue  # same line — one breakpoint per line is enough
+        last_y = y
+        t = start_delay + max(0.0, t0)
+        target = min(float(max_scroll), max(0.0, y - anchor))
+        prev_t, prev_y = points[-1]
+        if t <= prev_t + 0.05:
+            continue
+        points.append((t, max(target, prev_y)))  # never scroll backwards
+
+    if len(points) < 3:
+        return None
+
+    # Land on the very end of the strip: by speech end when the timings leave
+    # room, otherwise slide the last bit during the start of the hold.
+    t_last, y_last = points[-1]
+    if y_last < max_scroll:
+        t_end = scroll_end if scroll_end > t_last + 0.3 else t_last + min(1.5, HOLD_DURATION / 2)
+        points.append((t_end, float(max_scroll)))
+
+    terms = []
+    for (t0, y0), (t1, y1) in zip(points, points[1:]):
+        slope = (y1 - y0) / (t1 - t0)
+        terms.append(
+            f"(gte(t,{t0:.4f})*lt(t,{t1:.4f}))*({y0:.2f}+(t-{t0:.4f})*{slope:.4f})"
+        )
+    t_final, y_final = points[-1]
+    terms.append(f"gte(t,{t_final:.4f})*{y_final:.2f}")
+    return f"min({max_scroll},max(0,{'+'.join(terms)}))"
+
+
 def _build_highlight_layer(
     words: list[dict],
     temp_dir: Path,
@@ -621,16 +676,31 @@ def render_video(
 
     duration = START_DELAY + scroll_duration + HOLD_DURATION
 
+    # --- Word alignment (drives both the speech-synced scroll and karaoke) ---
+    aligned_words: list[dict] = []
+    if has_vo and vo_words:
+        aligned_words = _align_words(vo_words, word_boxes)
+
     # --- Karaoke highlight layer (needs the scroll timing above) ---
     highlight_layer = None
-    if highlight and has_vo and vo_words:
+    if highlight and aligned_words:
         highlight_layer = _build_highlight_layer(
-            _align_words(vo_words, word_boxes), temp_dir, stem,
+            aligned_words, temp_dir, stem,
             START_DELAY, duration, highlight_text_color, highlight_bg_color,
         )
 
     # --- ffmpeg command ---
+    # Whenever there is a voice with word timings, scroll follows the speech
+    # so the spoken word stays ~1/3 down the text area; without timings,
+    # fall back to the linear scroll.
     scroll_expr = f"min({max_scroll},max(0,t-{START_DELAY})*{scroll_speed:.6f})"
+    if aligned_words:
+        speech_expr = _build_scroll_expr(
+            aligned_words, max_scroll, text_viewport_h,
+            START_DELAY, START_DELAY + scroll_duration,
+        )
+        if speech_expr:
+            scroll_expr = speech_expr
     filter_parts = [
         f"[1:v]crop={VIDEO_WIDTH}:{text_viewport_h}:0:'{scroll_expr}'[txt]"
     ]
