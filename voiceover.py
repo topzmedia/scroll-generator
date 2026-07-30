@@ -1,0 +1,199 @@
+"""
+Voiceover generation — same voice roster as the Video Ad Editor (:3002).
+
+Voice values:
+  "edge:<MicrosoftVoiceName>"  — free Edge TTS voices (edge-tts CLI)
+  "el:<elevenlabs_voice_id>"   — ElevenLabs voices from the account
+
+Generated MP3s are cached in library/voiceovers keyed by (voice, text) hash,
+so regenerating a video never re-bills the TTS API.
+"""
+
+import hashlib
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+import requests
+
+BASE_DIR = Path(__file__).parent
+VO_CACHE_DIR = BASE_DIR / "library" / "voiceovers"
+EDITOR_ENV = Path("/Users/loris/Desktop/TOP Z/TopZ Dashboard/VideoAdEditor/server/.env")
+
+def _find_edge_tts() -> str:
+    import sys
+    venv_bin = Path(sys.executable).parent / "edge-tts"
+    if venv_bin.exists():
+        return str(venv_bin)
+    return shutil.which("edge-tts") or "/opt/homebrew/bin/edge-tts"
+
+
+EDGE_TTS_BIN = _find_edge_tts()
+
+# Same public fallback voice the editor uses when edge-tts dies (Adam,
+# mirrors the edge default male voice).
+ELEVEN_FALLBACK_VOICE = "pNInz6obpgDQGcFmaJgB"
+ELEVEN_MODEL = "eleven_multilingual_v2"
+ELEVEN_VOICE_SETTINGS = {"stability": 0.5, "similarity_boost": 0.75}
+
+# Identical roster + labels to the editor UI (client/src/App.js).
+STOCK_VOICES = [
+    {"group": "US Male", "voices": [
+        ("en-US-AndrewMultilingualNeural", "Andrew (Warm, Confident)"),
+        ("en-US-BrianMultilingualNeural", "Brian (Casual, Sincere)"),
+        ("en-US-ChristopherNeural", "Christopher (Authority)"),
+        ("en-US-EricNeural", "Eric (Rational)"),
+        ("en-US-GuyNeural", "Guy (Passionate)"),
+        ("en-US-RogerNeural", "Roger (Lively)"),
+        ("en-US-SteffanNeural", "Steffan (Rational)"),
+    ]},
+    {"group": "US Female", "voices": [
+        ("en-US-AvaMultilingualNeural", "Ava (Caring, Friendly)"),
+        ("en-US-EmmaMultilingualNeural", "Emma (Cheerful, Clear)"),
+        ("en-US-JennyNeural", "Jenny (Friendly)"),
+        ("en-US-AriaNeural", "Aria (Confident)"),
+        ("en-US-MichelleNeural", "Michelle (Pleasant)"),
+        ("en-US-AnaNeural", "Ana (Cute, Conversational)"),
+    ]},
+    {"group": "Canadian (US-Passing)", "voices": [
+        ("en-CA-LiamNeural", "Liam (Canadian)"),
+        ("en-CA-ClaraNeural", "Clara (Canadian)"),
+    ]},
+    {"group": "UK English", "voices": [
+        ("en-GB-RyanNeural", "Ryan (UK)"),
+        ("en-GB-SoniaNeural", "Sonia (UK)"),
+        ("en-GB-ThomasNeural", "Thomas (UK)"),
+        ("en-GB-LibbyNeural", "Libby (UK)"),
+        ("en-GB-MaisieNeural", "Maisie (UK)"),
+    ]},
+    {"group": "Other", "voices": [
+        ("en-AU-WilliamMultilingualNeural", "William (Australian)"),
+        ("en-AU-NatashaNeural", "Natasha (Australian)"),
+        ("en-NZ-MitchellNeural", "Mitchell (NZ)"),
+        ("en-NZ-MollyNeural", "Molly (NZ)"),
+        ("en-IE-ConnorNeural", "Connor (Irish)"),
+        ("en-IE-EmilyNeural", "Emily (Irish)"),
+    ]},
+]
+
+
+def _elevenlabs_key() -> str | None:
+    key = os.environ.get("ELEVENLABS_API_KEY")
+    if key:
+        return key
+    # Fallbacks: .env beside this module (VM deploys), then the editor's .env (local Mac)
+    for env_file in (BASE_DIR / ".env", EDITOR_ENV):
+        try:
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("ELEVENLABS_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    return None
+
+
+_eleven_cache: dict = {"ts": 0.0, "voices": []}
+
+
+def _fetch_eleven_voices() -> list[dict]:
+    """Live voice list from the ElevenLabs account, cached for 10 minutes."""
+    if time.time() - _eleven_cache["ts"] < 600:
+        return _eleven_cache["voices"]
+    key = _elevenlabs_key()
+    if not key:
+        return []
+    try:
+        r = requests.get(
+            "https://api.elevenlabs.io/v1/voices",
+            headers={"xi-api-key": key},
+            timeout=15,
+        )
+        r.raise_for_status()
+        voices = []
+        for v in r.json().get("voices", []):
+            labels = v.get("labels") or {}
+            voices.append({
+                "id": v.get("voice_id"),
+                "name": v.get("name"),
+                "category": v.get("category"),
+                "gender": labels.get("gender"),
+            })
+        # Own cloned/generated voices first, like the editor
+        voices.sort(key=lambda v: 0 if v["category"] in ("cloned", "generated") else 1)
+        _eleven_cache.update(ts=time.time(), voices=voices)
+        return voices
+    except Exception as e:
+        print(f"ElevenLabs voice list unavailable: {e}")
+        return _eleven_cache["voices"]
+
+
+def get_voice_catalog() -> dict:
+    return {
+        "stock": [
+            {"group": g["group"],
+             "voices": [{"value": f"edge:{vid}", "label": label} for vid, label in g["voices"]]}
+            for g in STOCK_VOICES
+        ],
+        "elevenlabs": _fetch_eleven_voices(),
+    }
+
+
+def _eleven_tts(text: str, voice_id: str, out_path: Path):
+    key = _elevenlabs_key()
+    if not key:
+        raise RuntimeError("ElevenLabs API key missing")
+    r = requests.post(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+        headers={"xi-api-key": key, "Content-Type": "application/json", "Accept": "audio/mpeg"},
+        json={"text": text, "model_id": ELEVEN_MODEL, "voice_settings": ELEVEN_VOICE_SETTINGS},
+        timeout=120,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"ElevenLabs TTS failed ({r.status_code}): {r.text[:300]}")
+    out_path.write_bytes(r.content)
+
+
+def _edge_tts(text: str, voice_name: str, out_path: Path):
+    """edge-tts with the editor's retry logic; falls back to ElevenLabs Adam."""
+    last_err = None
+    for attempt in range(1, 7):
+        try:
+            result = subprocess.run(
+                [EDGE_TTS_BIN, "--voice", voice_name, "--text", text,
+                 "--write-media", str(out_path)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+                return
+            last_err = result.stderr.strip() or "empty output"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(attempt * 0.4)
+    print(f"edge-tts failed after 6 attempts ({last_err}); falling back to ElevenLabs")
+    _eleven_tts(text, ELEVEN_FALLBACK_VOICE, out_path)
+
+
+def generate_voiceover(text: str, voice: str) -> str:
+    """Return path to a cached or freshly generated voiceover MP3."""
+    VO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(f"{voice}\n{text}".encode()).hexdigest()[:20]
+    out_path = VO_CACHE_DIR / f"vo_{key}.mp3"
+    if out_path.exists() and out_path.stat().st_size > 0:
+        return str(out_path)
+
+    tmp_path = out_path.with_suffix(".tmp.mp3")
+    try:
+        if voice.startswith("el:"):
+            _eleven_tts(text, voice[3:], tmp_path)
+        elif voice.startswith("edge:"):
+            _edge_tts(text, voice[5:], tmp_path)
+        else:
+            raise ValueError(f"Unknown voice format: {voice}")
+        tmp_path.rename(out_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    return str(out_path)

@@ -24,6 +24,22 @@ on:
         required: false
         type: string
         default: "38"
+      voice:
+        required: false
+        type: string
+        default: ""
+      voice_volume:
+        required: false
+        type: string
+        default: "100"
+      music_r2_key:
+        required: false
+        type: string
+        default: ""
+      music_volume:
+        required: false
+        type: string
+        default: "30"
 
 jobs:
   render:
@@ -36,86 +52,24 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
-          pip install Pillow boto3
+          pip install Pillow boto3 requests edge-tts
 
-      - name: Download image from R2
+      - name: Render and upload
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          CELL_KEY: ${{ inputs.cell_key }}
           IMAGE_R2_KEY: ${{ inputs.image_r2_key }}
-        run: |
-          python3 -c "
-          import boto3, os, pathlib
-          s3 = boto3.client('s3',
-              endpoint_url='https://346c911ecd013de0d51b44f77e5f2ec0.r2.cloudflarestorage.com',
-              aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
-              aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
-              region_name='auto')
-          key = os.environ['IMAGE_R2_KEY']
-          ext = pathlib.Path(key).suffix or '.png'
-          local_path = f'/tmp/input_image{ext}'
-          s3.download_file('scroll-generator', key, local_path)
-          with open('/tmp/image_path.txt', 'w') as f:
-              f.write(local_path)
-          print(f'Downloaded {key} to {local_path}')
-          "
-
-      - name: Write text to file
-        env:
           VIDEO_TEXT: ${{ inputs.text }}
-        run: |
-          python3 -c "
-          import os
-          text = os.environ['VIDEO_TEXT']
-          with open('/tmp/text_input.txt', 'w') as f:
-              f.write(text)
-          print(f'Wrote {len(text)} chars to /tmp/text_input.txt')
-          "
-
-      - name: Render video
-        env:
           SCROLL_SPEED: ${{ inputs.scroll_speed }}
           HOOK_FONT_SIZE: ${{ inputs.hook_font_size }}
           BODY_FONT_SIZE: ${{ inputs.body_font_size }}
-        run: |
-          python3 -c "
-          import os
-          from renderer import render_video
-          with open('/tmp/text_input.txt') as f:
-              text = f.read()
-          image_path = open('/tmp/image_path.txt').read().strip()
-          audio_path = 'audio.mp3' if os.path.exists('audio.mp3') else None
-          render_video(
-              image_path=image_path,
-              text=text,
-              output_path='/tmp/output.mp4',
-              scroll_speed=int(os.environ.get('SCROLL_SPEED', '80')),
-              hook_font_size=int(os.environ.get('HOOK_FONT_SIZE', '52')),
-              body_font_size=int(os.environ.get('BODY_FONT_SIZE', '38')),
-              audio_path=audio_path,
-          )
-          print('Video rendered successfully')
-          "
-
-      - name: Upload video to R2
-        env:
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          CELL_KEY: ${{ inputs.cell_key }}
-        run: |
-          python3 -c "
-          import boto3, os
-          s3 = boto3.client('s3',
-              endpoint_url='https://346c911ecd013de0d51b44f77e5f2ec0.r2.cloudflarestorage.com',
-              aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
-              aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
-              region_name='auto')
-          cell_key = os.environ['CELL_KEY']
-          s3.upload_file('/tmp/output.mp4', 'scroll-generator',
-              f'videos/generated/{cell_key}.mp4',
-              ExtraArgs={'ContentType': 'video/mp4'})
-          print(f'Uploaded videos/generated/{cell_key}.mp4 to R2')
-          "
+          VOICE: ${{ inputs.voice }}
+          VOICE_VOLUME: ${{ inputs.voice_volume }}
+          MUSIC_R2_KEY: ${{ inputs.music_r2_key }}
+          MUSIC_VOLUME: ${{ inputs.music_volume }}
+        run: python3 ci_render.py
 
       - name: Notify completion
         if: always()

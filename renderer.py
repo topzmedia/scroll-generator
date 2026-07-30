@@ -11,6 +11,17 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+def probe_duration(path: str) -> float:
+    """Return media duration in seconds via ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed for {path}:\n{result.stderr}")
+    return float(result.stdout.strip())
+
 from PIL import Image, ImageDraw, ImageFont
 
 # ---------------------------------------------------------------------------
@@ -214,7 +225,10 @@ def render_video(
     image_path: str,
     text: str,
     output_path: str,
-    audio_path: str = None,
+    music_path: str = None,
+    music_volume: float = 1.0,
+    vo_path: str = None,
+    vo_volume: float = 1.0,
     scroll_speed: int = SCROLL_SPEED,
     hook_font_size: int = HOOK_FONT_SIZE,
     body_font_size: int = BODY_FONT_SIZE,
@@ -262,7 +276,19 @@ def render_video(
     max_scroll = text_strip.height - text_viewport_h
     if max_scroll <= 0:
         max_scroll = 1
-    scroll_duration = max_scroll / scroll_speed
+
+    has_music = bool(music_path) and Path(music_path).exists()
+    has_vo = bool(vo_path) and Path(vo_path).exists()
+
+    if has_vo:
+        # Sync scroll to the voiceover: the text scrolls exactly as fast as
+        # the voice reads it — both start after START_DELAY and end together.
+        vo_duration = max(probe_duration(vo_path), 0.1)
+        scroll_speed = max_scroll / vo_duration
+        scroll_duration = vo_duration
+    else:
+        scroll_duration = max_scroll / scroll_speed
+
     # Total duration = start delay + scroll time + hold at end
     duration = START_DELAY + scroll_duration + HOLD_DURATION
 
@@ -271,16 +297,11 @@ def render_video(
     # input 1: tall text strip  (looped)
     # Crop the text strip to text_viewport_h, scrolling y from 0→max_scroll
     # Then overlay it at y=image_height on the static background
-    
-    # Fix mapping: The filter_complex outputs [0:v] effectively (or we need to map the result of the filter). 
-    # Wait, the filter `[0:v][txt]overlay` outputs a stream. We should label it.
-    
-    # Let's refine the command construction to be safer.
-    filter_complex = (
+    filter_parts = [
         f"[1:v]crop={VIDEO_WIDTH}:{text_viewport_h}:0:"
-        f"'min({max_scroll},max(0,t-{START_DELAY})*{scroll_speed})'[txt];"
+        f"'min({max_scroll},max(0,t-{START_DELAY})*{scroll_speed:.6f})'[txt];"
         f"[0:v][txt]overlay=0:{image_height}[v_out]"
-    )
+    ]
 
     ffmpeg_cmd = [
         "ffmpeg",
@@ -289,16 +310,37 @@ def render_video(
         "-loop", "1", "-i", str(temp_txt),
     ]
 
-    if audio_path and Path(audio_path).exists():
-        ffmpeg_cmd.extend(["-stream_loop", "-1", "-i", audio_path])
+    audio_labels = []
+    input_idx = 2
+    if has_music:
+        ffmpeg_cmd.extend(["-stream_loop", "-1", "-i", str(music_path)])
+        filter_parts.append(f"[{input_idx}:a]volume={music_volume:.3f}[a_m]")
+        audio_labels.append("[a_m]")
+        input_idx += 1
+    if has_vo:
+        ffmpeg_cmd.extend(["-i", str(vo_path)])
+        vo_delay_ms = int(START_DELAY * 1000)
+        filter_parts.append(
+            f"[{input_idx}:a]adelay={vo_delay_ms}:all=1,volume={vo_volume:.3f}[a_v]"
+        )
+        audio_labels.append("[a_v]")
+        input_idx += 1
+
+    if len(audio_labels) == 2:
+        filter_parts.append(f"{audio_labels[0]}{audio_labels[1]}amix=inputs=2:duration=longest:normalize=0[a_out]")
+        audio_map = "[a_out]"
+    elif len(audio_labels) == 1:
+        audio_map = audio_labels[0]
+    else:
+        audio_map = None
 
     ffmpeg_cmd.extend([
-        "-filter_complex", filter_complex,
+        "-filter_complex", ";".join(filter_parts),
         "-map", "[v_out]",
     ])
 
-    if audio_path and Path(audio_path).exists():
-         ffmpeg_cmd.extend(["-map", "2:a", "-c:a", "aac"])
+    if audio_map:
+        ffmpeg_cmd.extend(["-map", audio_map, "-c:a", "aac"])
 
     ffmpeg_cmd.extend([
         "-t", str(duration),
