@@ -40,6 +40,30 @@ on:
         required: false
         type: string
         default: "30"
+      image_height_pct:
+        required: false
+        type: string
+        default: "0"
+      highlight:
+        required: false
+        type: string
+        default: "1"
+      highlight_bg_color:
+        required: false
+        type: string
+        default: "#ffd93d"
+      highlight_text_color:
+        required: false
+        type: string
+        default: "#000000"
+      bg_color:
+        required: false
+        type: string
+        default: "#000000"
+      text_color:
+        required: false
+        type: string
+        default: "#ffffff"
 
 jobs:
   render:
@@ -69,6 +93,12 @@ jobs:
           VOICE_VOLUME: ${{ inputs.voice_volume }}
           MUSIC_R2_KEY: ${{ inputs.music_r2_key }}
           MUSIC_VOLUME: ${{ inputs.music_volume }}
+          IMAGE_HEIGHT_PCT: ${{ inputs.image_height_pct }}
+          HIGHLIGHT: ${{ inputs.highlight }}
+          HIGHLIGHT_BG_COLOR: ${{ inputs.highlight_bg_color }}
+          HIGHLIGHT_TEXT_COLOR: ${{ inputs.highlight_text_color }}
+          BG_COLOR: ${{ inputs.bg_color }}
+          TEXT_COLOR: ${{ inputs.text_color }}
         run: python3 ci_render.py
 
       - name: Notify completion

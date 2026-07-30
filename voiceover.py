@@ -2,14 +2,21 @@
 Voiceover generation — same voice roster as the Video Ad Editor (:3002).
 
 Voice values:
-  "edge:<MicrosoftVoiceName>"  — free Edge TTS voices (edge-tts CLI)
+  "edge:<MicrosoftVoiceName>"  — free Edge TTS voices (edge-tts)
   "el:<elevenlabs_voice_id>"   — ElevenLabs voices from the account
 
-Generated MP3s are cached in library/voiceovers keyed by (voice, text) hash,
-so regenerating a video never re-bills the TTS API.
+generate_voiceover() returns {"path": mp3, "words": [{text, start, end}, ...]}.
+Word timings drive the karaoke highlight in the renderer: Edge supplies them
+via WordBoundary events, ElevenLabs via its /with-timestamps endpoint.
+
+Both the MP3 and its word timings are cached in library/voiceovers keyed by
+(voice, text) hash, so regenerating a video never re-bills the TTS API.
 """
 
+import asyncio
+import base64
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -141,59 +148,112 @@ def get_voice_catalog() -> dict:
     }
 
 
-def _eleven_tts(text: str, voice_id: str, out_path: Path):
+def _words_from_char_alignment(alignment: dict) -> list[dict]:
+    """Group ElevenLabs per-character timings into per-word timings."""
+    chars = alignment.get("characters") or []
+    starts = alignment.get("character_start_times_seconds") or []
+    ends = alignment.get("character_end_times_seconds") or []
+    words = []
+    current, w_start, w_end = "", None, None
+    for i, ch in enumerate(chars):
+        if ch.isspace():
+            if current:
+                words.append({"text": current, "start": w_start, "end": w_end})
+                current, w_start, w_end = "", None, None
+            continue
+        current += ch
+        if w_start is None and i < len(starts):
+            w_start = starts[i]
+        if i < len(ends):
+            w_end = ends[i]
+    if current and w_start is not None:
+        words.append({"text": current, "start": w_start, "end": w_end})
+    return words
+
+
+def _eleven_tts(text: str, voice_id: str, out_path: Path) -> list[dict]:
+    """ElevenLabs TTS with character timings; returns per-word timings."""
     key = _elevenlabs_key()
     if not key:
         raise RuntimeError("ElevenLabs API key missing")
     r = requests.post(
-        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-        headers={"xi-api-key": key, "Content-Type": "application/json", "Accept": "audio/mpeg"},
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps",
+        headers={"xi-api-key": key, "Content-Type": "application/json"},
         json={"text": text, "model_id": ELEVEN_MODEL, "voice_settings": ELEVEN_VOICE_SETTINGS},
-        timeout=120,
+        timeout=180,
     )
     if r.status_code != 200:
         raise RuntimeError(f"ElevenLabs TTS failed ({r.status_code}): {r.text[:300]}")
-    out_path.write_bytes(r.content)
+    data = r.json()
+    out_path.write_bytes(base64.b64decode(data["audio_base64"]))
+    return _words_from_char_alignment(data.get("alignment") or {})
 
 
-def _edge_tts(text: str, voice_name: str, out_path: Path):
-    """edge-tts with the editor's retry logic; falls back to ElevenLabs Adam."""
+async def _edge_stream(text: str, voice_name: str, out_path: Path) -> list[dict]:
+    """Stream Edge TTS audio + WordBoundary events (exact per-word timings)."""
+    import edge_tts
+
+    communicate = edge_tts.Communicate(text, voice_name, boundary="WordBoundary")
+    audio = bytearray()
+    words = []
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio.extend(chunk["data"])
+        elif chunk["type"] == "WordBoundary":
+            start = chunk["offset"] / 1e7
+            words.append({
+                "text": chunk["text"],
+                "start": start,
+                "end": start + chunk["duration"] / 1e7,
+            })
+    if not audio:
+        raise RuntimeError("No audio was received")
+    out_path.write_bytes(bytes(audio))
+    return words
+
+
+def _edge_tts(text: str, voice_name: str, out_path: Path) -> list[dict]:
+    """Edge TTS with the editor's retry logic; falls back to ElevenLabs Adam."""
     last_err = None
     for attempt in range(1, 7):
         try:
-            result = subprocess.run(
-                [EDGE_TTS_BIN, "--voice", voice_name, "--text", text,
-                 "--write-media", str(out_path)],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
-                return
-            last_err = result.stderr.strip() or "empty output"
+            return asyncio.run(_edge_stream(text, voice_name, out_path))
         except Exception as e:
-            last_err = str(e)
+            last_err = e
         time.sleep(attempt * 0.4)
     print(f"edge-tts failed after 6 attempts ({last_err}); falling back to ElevenLabs")
-    _eleven_tts(text, ELEVEN_FALLBACK_VOICE, out_path)
+    return _eleven_tts(text, ELEVEN_FALLBACK_VOICE, out_path)
 
 
-def generate_voiceover(text: str, voice: str) -> str:
-    """Return path to a cached or freshly generated voiceover MP3."""
+def generate_voiceover(text: str, voice: str) -> dict:
+    """
+    Return {"path": <mp3 path>, "words": [{text, start, end}, ...]} for the
+    given text + voice, generating and caching it on first use.
+    """
     VO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha1(f"{voice}\n{text}".encode()).hexdigest()[:20]
     out_path = VO_CACHE_DIR / f"vo_{key}.mp3"
+    words_path = VO_CACHE_DIR / f"vo_{key}.json"
+
     if out_path.exists() and out_path.stat().st_size > 0:
-        return str(out_path)
+        words = []
+        try:
+            words = json.loads(words_path.read_text())
+        except (OSError, ValueError):
+            pass
+        return {"path": str(out_path), "words": words}
 
     tmp_path = out_path.with_suffix(".tmp.mp3")
     try:
         if voice.startswith("el:"):
-            _eleven_tts(text, voice[3:], tmp_path)
+            words = _eleven_tts(text, voice[3:], tmp_path)
         elif voice.startswith("edge:"):
-            _edge_tts(text, voice[5:], tmp_path)
+            words = _edge_tts(text, voice[5:], tmp_path)
         else:
             raise ValueError(f"Unknown voice format: {voice}")
         tmp_path.rename(out_path)
+        words_path.write_text(json.dumps(words))
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
-    return str(out_path)
+    return {"path": str(out_path), "words": words}

@@ -12,11 +12,15 @@ Env:
   VOICE_VOLUME     0-100
   MUSIC_R2_KEY     "" | R2 key under music/
   MUSIC_VOLUME     0-100
+  IMAGE_HEIGHT_PCT 0 = auto (image keeps aspect), else % of frame height
+  HIGHLIGHT        "1"/"0" — karaoke highlight of the spoken word
+  HIGHLIGHT_BG_COLOR, HIGHLIGHT_TEXT_COLOR, BG_COLOR, TEXT_COLOR
   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
   ELEVENLABS_API_KEY                              (for el: voices / fallback)
 """
 
 import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -50,6 +54,12 @@ def main():
     voice_volume = max(0, min(100, int(os.environ.get("VOICE_VOLUME") or 100)))
     music_r2_key = (os.environ.get("MUSIC_R2_KEY") or "").strip()
     music_volume = max(0, min(100, int(os.environ.get("MUSIC_VOLUME") or 30)))
+    image_height_pct = max(0, min(95, int(os.environ.get("IMAGE_HEIGHT_PCT") or 0)))
+    highlight = (os.environ.get("HIGHLIGHT") or "1") not in ("0", "false", "False", "")
+    highlight_text_color = (os.environ.get("HIGHLIGHT_TEXT_COLOR") or "#000000").strip()
+    highlight_bg_color = (os.environ.get("HIGHLIGHT_BG_COLOR") or "#ffd93d").strip()
+    bg_color = (os.environ.get("BG_COLOR") or "#000000").strip()
+    text_color = (os.environ.get("TEXT_COLOR") or "#ffffff").strip()
 
     client = s3()
 
@@ -66,21 +76,34 @@ def main():
         client.download_file(R2_BUCKET, music_r2_key, music_path)
         print(f"Downloaded music {music_r2_key}")
 
-    # Voiceover (optional, R2-cached)
+    # Voiceover (optional). Both the audio and its word timings are cached in
+    # R2, so a regenerate never re-bills the TTS API.
     vo_path = None
+    vo_words = None
     if voice:
         key = hashlib.sha1(f"{voice}\n{text}".encode()).hexdigest()[:20]
         vo_r2_key = f"voiceovers/vo_{key}.mp3"
+        words_r2_key = f"voiceovers/vo_{key}.json"
         vo_path = f"/tmp/vo_{key}.mp3"
+        words_path = f"/tmp/vo_{key}.json"
         try:
             client.download_file(R2_BUCKET, vo_r2_key, vo_path)
-            print(f"Voiceover cache hit: {vo_r2_key}")
+            try:
+                client.download_file(R2_BUCKET, words_r2_key, words_path)
+                vo_words = json.loads(Path(words_path).read_text())
+            except Exception:
+                vo_words = []
+            print(f"Voiceover cache hit: {vo_r2_key} ({len(vo_words or [])} word timings)")
         except Exception:
-            generated = generate_voiceover(text, voice)
-            os.replace(generated, vo_path)
+            vo = generate_voiceover(text, voice)
+            os.replace(vo["path"], vo_path)
+            vo_words = vo["words"]
             client.upload_file(vo_path, R2_BUCKET, vo_r2_key,
                                ExtraArgs={"ContentType": "audio/mpeg"})
-            print(f"Voiceover generated and cached: {vo_r2_key}")
+            Path(words_path).write_text(json.dumps(vo_words))
+            client.upload_file(words_path, R2_BUCKET, words_r2_key,
+                               ExtraArgs={"ContentType": "application/json"})
+            print(f"Voiceover generated and cached: {vo_r2_key} ({len(vo_words)} word timings)")
 
     render_video(
         image_path=image_path,
@@ -93,6 +116,13 @@ def main():
         music_volume=music_volume / 100.0,
         vo_path=vo_path,
         vo_volume=voice_volume / 100.0,
+        bg_color=bg_color,
+        text_color=text_color,
+        image_height_pct=image_height_pct,
+        vo_words=vo_words,
+        highlight=highlight,
+        highlight_text_color=highlight_text_color,
+        highlight_bg_color=highlight_bg_color,
     )
     print("Video rendered successfully")
 
